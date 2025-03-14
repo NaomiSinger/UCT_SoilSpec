@@ -1,10 +1,11 @@
+#This the the code developed to clean and run a test spectral dataset using OSSL frameworks.  
 ## Packages
 # latest GitHub release
 #remotes::install_github("mlr-org/mlr3extralearners@*release")
 
 pacman::p_load("tidyverse", tidyr, "curl", "qs", prospectr, mlr3, mlr3extralearners, Cubist, qs, data.table) 
 
-setwd("/Users/naomisinger/Library/CloudStorage/OneDrive-UniversityofCapeTown/")
+setwd("Paste pathway to chosen drive")
 
 ## Separate files
 soil <-  "https://storage.googleapis.com/soilspec4gg-public/ossl_soillab_L1_v1.2.qs"
@@ -15,7 +16,7 @@ names(soil)
 
 mir <- "https://storage.googleapis.com/soilspec4gg-public/ossl_mir_L0_v1.2.qs"
 mir <- qread_url(mir)
-mir <- qread("/Users/naomisinger/Library/CloudStorage/OneDrive-UniversityofCapeTown/DSP/mir_data.qs")
+mir <- qread("Paste pathway with spectral data")
 tail(names(mir))
 
 nrow(mir)
