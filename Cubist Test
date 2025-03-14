@@ -1,0 +1,203 @@
+## Packages
+# latest GitHub release
+#remotes::install_github("mlr-org/mlr3extralearners@*release")
+
+pacman::p_load("tidyverse", tidyr, "curl", "qs", prospectr, mlr3, mlr3extralearners, Cubist, qs, data.table) 
+
+setwd("/Users/naomisinger/Library/CloudStorage/OneDrive-UniversityofCapeTown/")
+
+## Separate files
+soil <-  "https://storage.googleapis.com/soilspec4gg-public/ossl_soillab_L1_v1.2.qs"
+soil <- qread_url(soil)
+nrow(soil)
+
+names(soil)
+
+mir <- "https://storage.googleapis.com/soilspec4gg-public/ossl_mir_L0_v1.2.qs"
+mir <- qread_url(mir)
+mir <- qread("/Users/naomisinger/Library/CloudStorage/OneDrive-UniversityofCapeTown/DSP/mir_data.qs")
+tail(names(mir))
+
+nrow(mir)
+
+
+# =======================
+# 🔹 STEP 1: Merge Soil & Spectral Data
+# =======================
+# Ensure IDs match in both datasets
+merged_data <- inner_join(soil, mir, by = c("dataset.code_ascii_txt", "id.layer_uuid_txt"))
+names(merged_data)
+
+
+
+# =======================
+# 🔹 STEP 2: Preprocess Spectral Data
+# =======================
+# Extract spectral column names (assuming they start with "scan_mir.")
+spectral_cols <- grep("^scan_mir\\.", colnames(merged_data), value = TRUE)
+
+# Define new wavelength range based on OSSL standards
+new_wavelengths <- seq(600, 4000, by = 2)
+
+#View(merged_data[, spectral_cols])
+
+#Get rid of NA in spectra
+merged_data <- merged_data %>% drop_na(scan_mir.2428_abs)
+
+#These are the soil properties of interest
+soil_properties <- c("n.tot_usda.a623_w.pct", "c.tot_usda.a622_w.pct", "clay.tot_usda.a334_w.pct", "sand.tot_usda.c60_w.pct", "silt.tot_usda.c62_w.pct", "ph.h2o_usda.a268_index")
+
+#Check that merged_data does not contain NA in these soil properties
+merged_data <- merged_data %>% drop_na(soil_properties)
+
+nrow(merged_data)
+
+#Just test on first 2000....
+merged_data <- merged_data[c(1:2000), ]
+
+#Create a partition between training and testing data
+set.seed(123)
+train_indices <- sample(1:nrow(merged_data), 0.8 * nrow(merged_data))
+train_data <- merged_data[train_indices, ]
+test_data <- merged_data[-train_indices, ]
+
+# Resample spectra to OSSL intervals
+resampled_spectra <- prospectr::resample(
+  X = as.matrix(train_data[, spectral_cols]),
+  wav = as.numeric(str_remove(gsub("scan_mir\\.", "", spectral_cols),"_abs")),  # Extract original wavelengths
+  new.wav = new_wavelengths,
+  interpol = "spline"
+)
+
+# Apply Standard Normal Variate (SNV) normalization
+help(standardNormalVariate)
+normalized_spectra <- prospectr::standardNormalVariate(resampled_spectra)
+
+# Convert back to a data frame and rename columns
+spectra_df <- as.data.frame(normalized_spectra)
+colnames(spectra_df) <- paste0("scan_mir.", new_wavelengths, "_abs")
+
+# Combine with soil property data
+processed_data <- cbind(train_data[, c("dataset.code_ascii_txt", "id.layer_uuid_txt")], spectra_df, train_data[setdiff(names(soil), c("dataset.code_ascii_txt", "id.layer_uuid_txt"))])
+
+# =======================
+# 🔹 STEP 3: Apply PCA for Feature Selection
+# =======================
+# Perform PCA on spectral data
+pca_model <- prcomp(spectra_df, center = TRUE, scale. = TRUE)
+
+# Select first 120 Principal Components (as per OSSL best practices)
+ncomps <- 120
+pca_scores <- predict(pca_model, spectra_df)[, 1:ncomps]
+
+# Convert PCA results to data frame and rename
+pca_df <- as.data.frame(pca_scores)
+colnames(pca_df) <- paste0("PC", 1:ncomps)
+
+# Merge PCA-transformed data with soil properties
+final_data <- cbind(train_data[, c("dataset.code_ascii_txt", "id.layer_uuid_txt")], pca_df, train_data[setdiff(names(soil), c("dataset.code_ascii_txt", "id.layer_uuid_txt"))])
+
+# =======================
+# 🔹 STEP 4: Train Cubist Model for Each Soil Property
+# =======================
+# Select soil properties for prediction
+soil_properties <- setdiff(names(soil), c("dataset.code_ascii_txt", "id.layer_uuid_txt"))
+#Just choose a few of interest
+soil_properties <- c("n.tot_usda.a623_w.pct", "c.tot_usda.a622_w.pct", "clay.tot_usda.a334_w.pct", "sand.tot_usda.c60_w.pct", "silt.tot_usda.c62_w.pct", "ph.h2o_usda.a268_index")
+
+# Loop through each soil property and train a model
+models <- list()
+for (target in soil_properties) {
+  
+  cat("\nTraining Cubist model for:", target, "\n")
+  
+  # Create mlr3 task
+  task_soil <- TaskRegr$new(
+    id = paste0("soil_", target),
+    backend = final_data,
+    target = target
+  )
+  
+  # Assign PCA components as features
+  task_soil$col_roles$feature <- paste0("PC", 1:ncomps)
+  
+  # Define Cubist model
+  learner <- lrn("regr.cubist", committees = 50, neighbors = 5)  # OSSL uses committees=50
+  
+  # Train model
+  learner$train(task_soil)
+  
+  # Store model
+  models[[target]] <- learner
+}
+
+# Save all models
+qs::qsave(models, "trained_cubist_models.qs")
+
+# =======================
+# 🔹 STEP 5: Predict New Soil Data
+# =======================
+# Function to apply models to new spectral data
+predict_soil_properties <- function(new_mir) {
+  # Resample and preprocess new spectra
+  new_resampled <- prospectr::resample(
+    X = as.matrix(new_mir[, spectral_cols]),
+    wav = as.numeric(str_remove(gsub("scan_mir\\.", "", spectral_cols),"_abs")),  # Extract original wavelengths
+    new.wav = new_wavelengths,
+    interpol = "spline"
+  )
+  
+  new_normalized <- prospectr::standardNormalVariate(new_resampled)
+  
+  # Convert to dataframe and rename columns exactly as in training
+  new_normalized <- as.data.frame(new_normalized)
+  colnames(new_normalized) <- paste0("scan_mir.", new_wavelengths, "_abs")  # Ensure correct names
+  
+  # Ensure column order matches PCA training set
+  new_normalized <- new_normalized[, colnames(spectra_df)]
+  
+  new_pca_scores <- predict(pca_model, new_normalized)[, 1:ncomps]
+  
+  new_pca_scores <- predict(pca_model, new_normalized)[, 1:ncomps]
+  
+  new_pca_df <- as.data.frame(new_pca_scores)
+  colnames(new_pca_df) <- paste0("PC", 1:ncomps)
+  
+  # Create results data frame
+  predictions <- data.frame(new_mir[, c("dataset.code_ascii_txt", "id.layer_uuid_txt")])
+  
+  # Apply each model
+  for (target in soil_properties) {
+    predictions[[target]] <- models[[target]]$predict_newdata(new_pca_df)$response
+  }
+  
+  return(predictions)
+}
+
+# Example usage (replace `new_mir_data` with actual data)
+new_mir_data <- test_data
+
+new_predictions <- predict_soil_properties(new_mir_data)
+
+# Save predictions
+# write.csv(new_predictions, "soil_predictions.csv", row.names = FALSE)
+
+
+new_predictions_long <- pivot_longer(new_predictions, cols = -c("dataset.code_ascii_txt", "id.layer_uuid_txt"), names_to = "soil_property", values_to = "predicted_value")
+
+
+new_mir_data_long <- pivot_longer(new_mir_data, cols = soil_properties, names_to = "soil_property", values_to = "observed_value")
+
+# Merge observed and predicted values
+pred_obs <- inner_join(new_predictions_long, new_mir_data_long, by = c("dataset.code_ascii_txt", "id.layer_uuid_txt", "soil_property"))
+tail(names(pred_obs))
+#ggplot the new_prections versus those in the test data
+ggplot(pred_obs, aes(x = observed_value, y = predicted_value)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  facet_wrap(~soil_property, scales = "free") +
+  labs(title = "Predicted vs. Observed Soil Properties",
+       x = "Observed Value",
+       y = "Predicted Value") +
+  theme_minimal()
+
